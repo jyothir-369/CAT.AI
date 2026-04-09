@@ -1,0 +1,39 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-v --tb=short"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = ["E501", "B008", "B904"]
+exclude = [
+    ".venv",
+    "__pycache__",
+    "db/migrations/versions",
+    "node_modules",
+]
+
+[tool.ruff.per-file-ignores]
+"__init__.py" = ["F401"]
+"db/migrations/**" = ["F401", "E402"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = false
+warn_unused_configs = true
+ignore_missing_imports = true
+exclude = ["db/migrations/", "tests/"]
+
+[tool.coverage.run]
+source = ["apps/api"]
+omit = ["*/migrations/*", "*/tests/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]

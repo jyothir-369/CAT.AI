@@ -1,0 +1,159 @@
+name: Deploy — Staging
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false   # never cancel an in-flight deployment
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPO_API: cat-ai/api
+  ECR_REPO_WORKER: cat-ai/worker
+  ECS_CLUSTER: cat-ai-staging
+  ECS_SERVICE_API: cat-ai-api-staging
+  ECS_SERVICE_WORKER: cat-ai-worker-staging
+
+jobs:
+  # ── Build & push Docker images ──────────────────────────────────────────────
+  build:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.tag.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: tag
+        run: echo "tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push API image
+        run: |
+          docker build \
+            -f infra/docker/Dockerfile.api \
+            -t $ECR_REGISTRY/$ECR_REPO_API:${{ steps.tag.outputs.tag }} \
+            -t $ECR_REGISTRY/$ECR_REPO_API:staging-latest \
+            .
+          docker push $ECR_REGISTRY/$ECR_REPO_API:${{ steps.tag.outputs.tag }}
+          docker push $ECR_REGISTRY/$ECR_REPO_API:staging-latest
+
+      - name: Build & push Worker image
+        run: |
+          docker build \
+            -f infra/docker/Dockerfile.worker \
+            -t $ECR_REGISTRY/$ECR_REPO_WORKER:${{ steps.tag.outputs.tag }} \
+            -t $ECR_REGISTRY/$ECR_REPO_WORKER:staging-latest \
+            .
+          docker push $ECR_REGISTRY/$ECR_REPO_WORKER:${{ steps.tag.outputs.tag }}
+          docker push $ECR_REGISTRY/$ECR_REPO_WORKER:staging-latest
+
+  # ── Run DB migrations ───────────────────────────────────────────────────────
+  migrate:
+    name: Run DB Migrations
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run migration ECS task
+        run: |
+          aws ecs run-task \
+            --cluster $ECS_CLUSTER \
+            --task-definition cat-ai-migrate-staging \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ secrets.SUBNET_IDS }}],securityGroups=[${{ secrets.SG_IDS }}]}" \
+            --overrides '{"containerOverrides":[{"name":"api","command":["python","-m","alembic","-c","db/migrations/alembic.ini","upgrade","head"]}]}' \
+            --wait
+
+  # ── Deploy to ECS (blue-green) ──────────────────────────────────────────────
+  deploy:
+    name: Deploy to ECS Staging
+    runs-on: ubuntu-latest
+    needs: [build, migrate]
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update API service
+        run: |
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE_API \
+            --force-new-deployment \
+            --deployment-configuration "deploymentCircuitBreaker={enable=true,rollback=true}"
+
+      - name: Update Worker service
+        run: |
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE_WORKER \
+            --force-new-deployment
+
+      - name: Wait for API stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE_API
+
+  # ── E2E tests against staging ───────────────────────────────────────────────
+  e2e:
+    name: E2E Tests (Staging)
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: latest
+
+      - name: Install Playwright
+        run: |
+          cd tests/e2e
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install chromium --with-deps
+
+      - name: Run E2E tests
+        run: |
+          cd tests/e2e
+          pnpm exec playwright test
+        env:
+          BASE_URL: ${{ secrets.STAGING_URL }}
+          TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
+          TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-staging
+          path: tests/e2e/playwright-report/
+          retention-days: 7

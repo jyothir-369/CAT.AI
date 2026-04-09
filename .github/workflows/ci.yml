@@ -1,0 +1,174 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [develop]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Python lint + type check ────────────────────────────────────────────────
+  lint-api:
+    name: Lint & Type Check (API)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install deps
+        run: |
+          pip install ruff mypy
+          pip install -r apps/api/requirements.txt
+
+      - name: Ruff lint
+        run: ruff check apps/api apps/worker scripts
+        continue-on-error: false
+
+      - name: Ruff format check
+        run: ruff format --check apps/api apps/worker scripts
+
+      - name: MyPy type check
+        run: |
+          cd apps/api
+          mypy . --ignore-missing-imports --exclude db/migrations
+        continue-on-error: true   # non-blocking until type coverage improves
+
+  # ── Unit tests (no DB, no Redis) ────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install deps
+        run: |
+          pip install pytest pytest-asyncio pytest-cov
+          pip install -r apps/api/requirements.txt
+
+      - name: Run unit tests
+        run: |
+          cd apps/api
+          python -m pytest ../../tests/unit \
+            --tb=short \
+            -v \
+            --cov=. \
+            --cov-report=term-missing \
+            --cov-report=xml:../../coverage.xml
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/catai_test
+          REDIS_URL: redis://localhost:6379/1
+          JWT_SECRET: test-jwt-secret-for-ci
+          SECRET_KEY: test-secret-key-for-ci
+          DEBUG: "true"
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          file: coverage.xml
+          fail_ci_if_error: false
+
+  # ── Integration tests (real DB + Redis via services) ───────────────────────
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: catai_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install deps
+        run: |
+          pip install pytest pytest-asyncio httpx
+          pip install -r apps/api/requirements.txt
+
+      - name: Run DB migrations
+        run: |
+          cd apps/api
+          python -m alembic -c db/migrations/alembic.ini upgrade head
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/catai_test
+
+      - name: Run integration tests
+        run: |
+          cd apps/api
+          python -m pytest ../../tests/integration \
+            --tb=short \
+            -v \
+            --timeout=60
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/catai_test
+          REDIS_URL: redis://localhost:6379/1
+          JWT_SECRET: test-jwt-secret-for-ci
+          SECRET_KEY: test-secret-key-for-ci
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY_TEST }}
+          DEBUG: "true"
+
+  # ── Frontend type check ─────────────────────────────────────────────────────
+  lint-web:
+    name: Lint & Type Check (Web)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: pnpm
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: latest
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      - name: TypeScript check
+        run: pnpm tsc --noEmit
+
+      - name: ESLint
+        run: pnpm lint

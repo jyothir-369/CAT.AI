@@ -1,0 +1,149 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CAT AI — Local Development Stack
+# Usage:
+#   docker compose up -d          # start all services
+#   docker compose logs -f api    # tail API logs
+#   docker compose down -v        # stop and remove volumes
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── PostgreSQL with pgvector ──────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: catai_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: catai
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d catai"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Redis ─────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: catai_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── FastAPI API ────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.api
+    container_name: catai_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - ../../apps/api/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/catai
+      REDIS_URL: redis://redis:6379/0
+      DEBUG: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ../../apps/api:/app
+    command: >
+      sh -c "
+        cd /app &&
+        python -m alembic -c db/migrations/alembic.ini upgrade head &&
+        uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+      "
+
+  # ── Celery Worker ─────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.worker
+    container_name: catai_worker
+    restart: unless-stopped
+    env_file:
+      - ../../apps/api/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/catai
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ../../apps:/apps
+    command: >
+      sh -c "
+        cd /apps/worker &&
+        celery -A celery_app worker
+          --loglevel=info
+          --queues=ingestion,memory,workflows,notifications,summarize,usage
+          --concurrency=4
+      "
+
+  # ── Celery Beat (cron scheduler) ──────────────────────────────────────────
+  beat:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.worker
+    container_name: catai_beat
+    restart: unless-stopped
+    env_file:
+      - ../../apps/api/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/catai
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - redis
+      - worker
+    volumes:
+      - ../../apps:/apps
+    command: >
+      sh -c "
+        cd /apps/worker &&
+        celery -A celery_app beat --loglevel=info
+      "
+
+  # ── Next.js Frontend ──────────────────────────────────────────────────────
+  web:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.web
+    container_name: catai_web
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    depends_on:
+      - api
+    volumes:
+      - ../../apps/web:/app
+      - /app/node_modules
+      - /app/.next
+    command: pnpm dev
+
+volumes:
+  postgres_data:
+  redis_data:

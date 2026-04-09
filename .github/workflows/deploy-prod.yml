@@ -1,0 +1,205 @@
+name: Deploy — Production
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"   # triggers on version tags: v1.2.3
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPO_API: cat-ai/api
+  ECR_REPO_WORKER: cat-ai/worker
+  ECS_CLUSTER: cat-ai-prod
+  ECS_SERVICE_API: cat-ai-api-prod
+  ECS_SERVICE_WORKER: cat-ai-worker-prod
+
+jobs:
+  # ── Promote staging image to prod tag ──────────────────────────────────────
+  promote:
+    name: Promote Image to Production
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.tag.outputs.tag }}
+
+    steps:
+      - name: Get version tag
+        id: tag
+        run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Re-tag staging-latest as the versioned prod image
+      - name: Retag API image for production
+        run: |
+          MANIFEST=$(aws ecr batch-get-image \
+            --repository-name $ECR_REPO_API \
+            --image-ids imageTag=staging-latest \
+            --query 'images[0].imageManifest' --output text)
+          aws ecr put-image \
+            --repository-name $ECR_REPO_API \
+            --image-tag ${{ steps.tag.outputs.tag }} \
+            --image-manifest "$MANIFEST"
+          aws ecr put-image \
+            --repository-name $ECR_REPO_API \
+            --image-tag prod-latest \
+            --image-manifest "$MANIFEST"
+
+      - name: Retag Worker image for production
+        run: |
+          MANIFEST=$(aws ecr batch-get-image \
+            --repository-name $ECR_REPO_WORKER \
+            --image-ids imageTag=staging-latest \
+            --query 'images[0].imageManifest' --output text)
+          aws ecr put-image \
+            --repository-name $ECR_REPO_WORKER \
+            --image-tag ${{ steps.tag.outputs.tag }} \
+            --image-manifest "$MANIFEST"
+          aws ecr put-image \
+            --repository-name $ECR_REPO_WORKER \
+            --image-tag prod-latest \
+            --image-manifest "$MANIFEST"
+
+  # ── Production DB migrations ────────────────────────────────────────────────
+  migrate-prod:
+    name: Production DB Migrations
+    runs-on: ubuntu-latest
+    needs: promote
+    environment: production   # requires manual approval in GitHub Environments
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_PROD }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run migration ECS task
+        run: |
+          aws ecs run-task \
+            --cluster $ECS_CLUSTER \
+            --task-definition cat-ai-migrate-prod \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ secrets.PROD_SUBNET_IDS }}],securityGroups=[${{ secrets.PROD_SG_IDS }}]}" \
+            --overrides '{"containerOverrides":[{"name":"api","command":["python","-m","alembic","-c","db/migrations/alembic.ini","upgrade","head"]}]}' \
+            --wait
+
+  # ── Canary deployment — 10% traffic ────────────────────────────────────────
+  deploy-canary:
+    name: Canary Deployment (10%)
+    runs-on: ubuntu-latest
+    needs: migrate-prod
+    environment: production
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_PROD }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy canary (1 new task out of 10)
+        run: |
+          # Update task definition with new image
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition cat-ai-api-prod \
+            --query taskDefinition)
+
+          # Register new task definition revision with prod-latest image
+          aws ecs register-task-definition \
+            --cli-input-json "$TASK_DEF"
+
+          # Update service with 1 new task (canary)
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE_API \
+            --desired-count 10 \
+            --task-definition cat-ai-api-prod
+
+      - name: Monitor canary error rate (5 minutes)
+        run: |
+          echo "Monitoring CloudWatch metrics for 5 minutes..."
+          sleep 300
+
+          # Check 5xx error rate via CloudWatch
+          ERROR_RATE=$(aws cloudwatch get-metric-statistics \
+            --namespace AWS/ApplicationELB \
+            --metric-name HTTPCode_Target_5XX_Count \
+            --dimensions Name=LoadBalancer,Value=${{ secrets.ALB_ARN_SUFFIX }} \
+            --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ) \
+            --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            --period 300 \
+            --statistics Sum \
+            --query 'Datapoints[0].Sum' \
+            --output text)
+
+          echo "5xx errors in last 5 min: $ERROR_RATE"
+
+          if [ "$ERROR_RATE" != "None" ] && [ $(echo "$ERROR_RATE > 10" | bc) -eq 1 ]; then
+            echo "❌ Error rate too high — rolling back"
+            exit 1
+          fi
+          echo "✅ Canary healthy"
+
+  # ── Full rollout ────────────────────────────────────────────────────────────
+  deploy-full:
+    name: Full Production Rollout
+    runs-on: ubuntu-latest
+    needs: deploy-canary
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_PROD }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Complete rollout — all API tasks
+        run: |
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE_API \
+            --force-new-deployment \
+            --deployment-configuration "deploymentCircuitBreaker={enable=true,rollback=true},maximumPercent=200,minimumHealthyPercent=100"
+
+      - name: Update Worker service
+        run: |
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE_WORKER \
+            --force-new-deployment
+
+      - name: Wait for stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE_API $ECS_SERVICE_WORKER
+
+      - name: Tag release in GitHub
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: context.ref.replace('refs/tags/', ''),
+              name: context.ref.replace('refs/tags/', ''),
+              body: 'Production deployment successful ✅',
+              draft: false,
+              prerelease: false,
+            })
